@@ -15,7 +15,7 @@
   /* ───────── storage (safe) ───────── */
   const store = {
     get(k, d) { try { const v = localStorage.getItem('u3.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-    set(k, v) { try { localStorage.setItem('u3.' + k, JSON.stringify(v)); } catch {} },
+    set(k, v) { try { localStorage.setItem('u3.' + k, JSON.stringify(v)); } catch {} if (store.onChange) store.onChange(k); },
     del(k) { try { localStorage.removeItem('u3.' + k); } catch {} },
     all() { const o = {}; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('u3.')) o[k.slice(3)] = JSON.parse(localStorage.getItem(k)); } } catch {} return o; },
   };
@@ -54,6 +54,7 @@
     play: '<path d="M7 4v16l13-8z"/>', check: '<path d="M20 6 9 17l-5-5"/>',
     drop: '<path d="M12 2.7 17.7 8.4a8 8 0 1 1-11.3 0z"/>', image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>',
     logo: '<circle cx="12" cy="12" r="9.5"/><path d="M3.6 13.2c2.1-1.7 3.7-1.7 5.8 0s3.7 1.7 5.8 0 3.7-1.7 5.2-.4"/><path d="M6.5 16.6c1.8-1.2 3.3-1.2 5.1 0s3.3 1.2 5.1 0"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
     refresh: '<path d="M3 12a9 9 0 0 1 15.4-6.4L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.4 6.4L3 16M3 21v-5h5"/>',
   };
   const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${P[n] || ''}</svg>`;
@@ -75,12 +76,10 @@
   /* ───────── settings ───────── */
   const lowEnd = (navigator.hardwareConcurrency || 4) <= 4 || /CrOS/.test(navigator.userAgent);
   const DEF = {
-    theme: 'reef', quality: lowEnd ? 'low' : 'medium', density: 'normal', ocean: true, fish: true, bubbles: true, kelp: true,
+    theme: 'reef', autoTheme: false, quality: lowEnd ? 'low' : 'medium', density: 'normal', ocean: true, fish: true, bubbles: true, kelp: true,
     pauseBehind: true, fps: false, startDesktop: false, clock24: false,
     reduceMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
     cloakTitle: 'New Tab', cloakIcon: '', blankUrl: true, adblock: true, panicKey: 'y', panicUrl: 'https://classroom.google.com',
-    ollamaDirect: '', showThinking: true,
-    systemPrompt: 'You are Unity AI, a helpful assistant built into an ocean-themed start page. Be concise and direct.',
   };
   const S = Object.assign({}, DEF, store.get('settings', {}));
   // migrate v1 cloak + shortcuts
@@ -92,7 +91,7 @@
   function setSetting(k, v) { S[k] = v; store.set('settings', S); applySetting(k); emit('setting', k); }
   function applySetting(k) {
     switch (k) {
-      case 'theme': applyTheme(); break;
+      case 'theme': case 'autoTheme': applyTheme(); break;
       case 'quality': Water.setQuality(S.quality); break;
       case 'density': Water.setDensity({ calm: 0.6, normal: 1, lively: 1.6 }[S.density] || 1); break;
       case 'ocean': Water.setEnabled(S.ocean); break;
@@ -106,14 +105,22 @@
       default: break;
     }
   }
+  function themeKey() {
+    if (!S.autoTheme) return S.theme;
+    const h = new Date().getHours();
+    return h >= 6 && h < 10 ? 'lagoon' : h >= 10 && h < 17 ? 'reef' : h >= 17 && h < 20 ? 'dusk' : 'abyss';
+  }
+  let appliedTheme = null;
   function applyTheme() {
-    const th = THEMES[S.theme] || THEMES.reef;
+    const key = themeKey(); appliedTheme = key;
+    const th = THEMES[key] || THEMES.reef;
     const r = document.documentElement.style, d = rgbOf(th.deep);
     r.setProperty('--accent', th.accent);
     r.setProperty('--on-accent', th.deep);
     r.setProperty('--deep', th.deep);
     r.setProperty('--glass', `rgba(${d[0]},${d[1]},${d[2]},.58)`);
     r.setProperty('--glass-strong', `rgba(${d[0]},${d[1]},${d[2]},.86)`);
+    r.setProperty('--solid', `rgba(${d[0]},${d[1]},${d[2]},.95)`);
     $('meta[name="theme-color"]').content = th.deep;
     Water.setTheme(th);
   }
@@ -133,7 +140,21 @@
 
   /* ───────── games: favorites, plays ───────── */
   const GAMES = window.GAMES || [];
+  let customGames = store.get('customGames', []);
+  customGames.forEach((g) => GAMES.push(Object.assign({ custom: true }, g)));
   const GBY = new Map(GAMES.map((g) => [g.id, g]));
+  function addCustomGame(name, url, cat) {
+    const g = { id: 'my-' + uid(), name, url, cat: cat || 'My games', custom: true };
+    customGames.push({ id: g.id, name, url, cat: g.cat }); store.set('customGames', customGames);
+    GAMES.push(g); GBY.set(g.id, g); emit('games'); toast(`Added ${name} to your library`);
+  }
+  function removeCustomGame(id) {
+    const g = GBY.get(id); if (!g || !g.custom) return;
+    customGames = customGames.filter((c) => c.id !== id); store.set('customGames', customGames);
+    GAMES.splice(GAMES.indexOf(g), 1); GBY.delete(id);
+    if (isFav(id)) { favs = favs.filter((x) => x !== id); store.set('favs', favs); emit('favs'); }
+    emit('games'); toast(`Removed ${g.name}`, 'trash');
+  }
   let favs = store.get('favs', []).filter((id) => GBY.has(id));
   let plays = store.get('plays', {});
   const isFav = (id) => favs.includes(id);
@@ -153,7 +174,7 @@
   function gameCard(g) {
     const p = plays[g.id], fav = isFav(g.id);
     const sub = p && p.n ? `Played ${p.n}× · ${timeAgo(p.t)}` : g.cat;
-    return `<div class="gcard" data-play="${g.id}" role="button" tabindex="0" aria-label="Play ${esc(g.name)}">
+    return `<div class="gcard" data-play="${g.id}"${g.custom ? ' data-custom="1"' : ''} role="button" tabindex="0" aria-label="Play ${esc(g.name)}">
       <div class="gart" style="${artVars(g)}"><span class="gcat">${esc(g.cat)}</span><span class="gletter">${esc(letters(g.name))}</span>
         <div class="gplay"><span>${ic('play')}</span></div></div>
       <button class="gstar${fav ? ' on' : ''}" data-fav="${g.id}" title="${fav ? 'Remove from favorites' : 'Add to favorites'}" aria-pressed="${fav}">${ic('star')}</button>
@@ -163,7 +184,7 @@
   /* library — can be mounted more than once (browser view + desktop window) */
   function Library(root, opts = {}) {
     const st = { c: opts.collection || 'all', q: '', sort: store.get('libSort', 'az') };
-    const cats = [...new Set(GAMES.map((g) => g.cat))].sort();
+    let cats = [];
     root.innerHTML = `<div class="lib">
       <aside class="lib-side"></aside>
       <div class="lib-main">
@@ -171,7 +192,8 @@
           <h2></h2>
           <label class="lib-search">${ic('search')}<input placeholder="Search games" aria-label="Search games"></label>
           <select class="lib-sort" aria-label="Sort"><option value="az">A to Z</option><option value="popular">Most played</option><option value="recent">Recently played</option></select>
-          <button class="btn" data-random title="Play a random game (Alt+R)" style="display:flex;align-items:center;gap:7px">${ic('shuffle')}Random</button>
+          <button class="btn" data-random title="Play a random game (Alt+R)">${ic('shuffle')}Random</button>
+          <button class="btn" data-add-game title="Add your own game">${ic('plus')}Add game</button>
         </div>
         <div class="lib-cats-m"></div>
         <div class="lib-grid"></div>
@@ -192,6 +214,7 @@
       return l;
     };
     function renderSide() {
+      cats = [...new Set(GAMES.map((g) => g.cat))].sort();
       const item = (c, label, icon, n) => `<button data-c="${esc(c)}" class="${st.c === c ? 'active' : ''}">${ic(icon)}<span>${esc(label)}</span><span class="count">${n}</span></button>`;
       side.innerHTML = item('all', 'All games', 'grid', GAMES.length) + item('favorites', 'Favorites', 'star', favs.length) + item('recent', 'Recently played', 'clock', recentIds().length)
         + '<h3>Categories</h3>' + cats.map((c) => item(c, c, 'gamepad', GAMES.filter((g) => g.cat === c).length)).join('');
@@ -211,12 +234,13 @@
     }
     root.addEventListener('click', (e) => {
       const c = e.target.closest('[data-c]'); if (c) { st.c = c.dataset.c; render(); grid.scrollTop = 0; return; }
+      if (e.target.closest('[data-add-game]')) { openGameDialog(); return; }
       if (e.target.closest('[data-random]')) { const l = list(); const g = (l.length ? l : GAMES)[Math.floor(Math.random() * (l.length || GAMES.length))]; if (g) play(g.id, opts.ctx); }
     });
     input.addEventListener('input', () => { st.q = input.value.trim(); render(); });
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const g = list()[0]; if (g) play(g.id, opts.ctx); } });
     sortSel.addEventListener('change', () => { st.sort = sortSel.value; store.set('libSort', st.sort); render(); });
-    on('favs', render); on('plays', render);
+    on('favs', render); on('plays', render); on('games', render);
     render();
     return { setCollection(c) { st.c = c; render(); }, focus() { input.focus(); input.select(); }, el: root };
   }
@@ -474,55 +498,21 @@
     if (moviesRoot.parentNode !== host) host.appendChild(moviesRoot);
   }
 
-  /* ───────── AI chat ───────── */
-  const MODELS = [
-    { id: 'ollama', label: 'My PC', provider: 'ollama' },
-    { id: 'openai', label: 'GPT-4o mini', provider: 'pollinations' },
-    { id: 'mistral', label: 'Mistral', provider: 'pollinations' },
-    { id: 'searchgpt', label: 'Search GPT', provider: 'pollinations' },
-  ];
-  let chats = store.get('chats', []), curChat = null, aiModel = store.get('aiModel', 'ollama'), ollamaModel = store.get('ollamaModel', '');
-  let aiStatus = { ollama: { configured: false, online: false, models: [] } }, aiBusy = null, aiRoot = null;
+  /* ───────── AI chat (deepseek-r1:7b on the owner's PC via Ollama) ───────── */
+  const SYSTEM = 'You are Unity AI, a helpful assistant built into an ocean-themed start page. Be concise and direct.';
+  let chats = store.get('chats', []), curChat = null;
+  let aiStatus = { configured: false, online: false, model: 'deepseek-r1:7b' }, aiBusy = null, aiRoot = null;
   const saveChats = () => store.set('chats', chats.slice(0, 40));
 
   async function refreshAIStatus() {
-    try {
-      if (S.ollamaDirect) {
-        const r = await fetch(S.ollamaDirect.replace(/\/+$/, '') + '/api/tags', { signal: AbortSignal.timeout(5000) });
-        const j = await r.json();
-        aiStatus = { ollama: { configured: true, online: r.ok, models: (j.models || []).map((m) => m.name), model: ollamaModel || 'deepseek-r1:7b', via: 'direct' } };
-      } else {
-        const r = await fetch('/ai/status', { signal: AbortSignal.timeout(8000) });
-        aiStatus = await r.json();
-      }
-    } catch (e) {
-      aiStatus = { ollama: { configured: !!S.ollamaDirect, online: false, models: [], error: e.message } };
-    }
-    renderAITop(); renderAIStatusBox();
-    return aiStatus;
-  }
-  function renderAIStatusBox() {
-    const box = $('#ai-status-box'); if (!box) return;
-    const o = aiStatus.ollama || {};
-    const dot = o.online ? 'ok' : o.configured ? 'bad' : '';
-    const msg = !o.configured ? 'Not set up yet. Add OLLAMA_URL to your Railway variables.'
-      : o.online ? `Connected${o.via ? ' via ' + o.via : ''}. ${o.models.length} model${o.models.length === 1 ? '' : 's'} installed: ${o.models.slice(0, 6).join(', ') || 'none'}.`
-      : `Configured but offline${o.error ? ' (' + o.error + ')' : ''}. Is the PC awake and on Tailscale?`;
-    box.innerHTML = `<span class="dot ${dot}"></span><span>${esc(msg)}</span><button class="link" style="margin-left:auto" data-ai-recheck>Check again</button>`;
+    try { const r = await fetch('/ai/status', { signal: AbortSignal.timeout(8000) }); aiStatus = await r.json(); }
+    catch { aiStatus = { configured: false, online: false, model: 'deepseek-r1:7b', unreachable: true }; }
+    renderAITop(); return aiStatus;
   }
   function renderAITop() {
     if (!aiRoot) return;
-    const o = aiStatus.ollama || {};
-    const models = $('.ai-models', aiRoot);
-    models.innerHTML = MODELS.map((m) => {
-      if (m.id === 'ollama') {
-        const dot = o.online ? 'ok' : o.configured ? 'bad' : '';
-        const name = (ollamaModel || o.model || 'deepseek-r1:7b');
-        return `<button class="ai-model${aiModel === 'ollama' ? ' on' : ''}" data-model="ollama" title="${esc(o.online ? 'Your PC is online' : 'Your PC is offline or not set up')}"><span class="dot ${dot}"></span>${esc(m.label)}<span style="opacity:.7;font-weight:500">${esc(name)}</span></button>`;
-      }
-      return `<button class="ai-model${aiModel === m.id ? ' on' : ''}" data-model="${m.id}">${esc(m.label)}</button>`;
-    }).join('') + (aiModel === 'ollama' && o.models && o.models.length > 1
-      ? `<select class="lib-sort" data-ollama-model style="height:30px">${o.models.map((n) => `<option ${n === (ollamaModel || o.model) ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>` : '');
+    const st = aiStatus.online ? ['ok', 'Online'] : aiStatus.missingModel ? ['bad', 'Model not installed'] : ['bad', 'Offline'];
+    $('.ai-top', aiRoot).innerHTML = `<b class="ai-title">Unity AI</b><span class="ai-badge" title="${esc(aiStatus.online ? 'Ready' : 'The AI computer is off or unreachable')}"><span class="dot ${st[0]}"></span>${esc(aiStatus.model || 'deepseek-r1:7b')}<span class="ai-state">${st[1]}</span></span>`;
   }
   function mountAI(host) {
     if (!aiRoot) buildAI();
@@ -535,7 +525,7 @@
     aiRoot.innerHTML = `
       <aside class="ai-side"><button class="btn" data-ai-new>${ic('plus')}New chat</button><div class="ai-chats"></div></aside>
       <div class="ai-main">
-        <div class="ai-top"><div class="ai-models"></div></div>
+        <div class="ai-top"></div>
         <div class="ai-msgs" aria-live="polite"></div>
         <form class="ai-input"><textarea rows="1" placeholder="Message Unity AI" aria-label="Message"></textarea><button class="btn primary" type="submit" title="Send (Enter)">${ic('send')}</button></form>
       </div>`;
@@ -544,14 +534,13 @@
     ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } });
     form.addEventListener('submit', (e) => { e.preventDefault(); if (aiBusy) { aiBusy.abort(); return; } const v = ta.value.trim(); if (!v) return; ta.value = ''; ta.style.height = 'auto'; aiSend(v); });
     aiRoot.addEventListener('click', (e) => {
-      const m = e.target.closest('[data-model]'); if (m) { aiModel = m.dataset.model; store.set('aiModel', aiModel); renderAITop(); return; }
       if (e.target.closest('[data-ai-new]')) { curChat = null; renderChat(); ta.focus(); return; }
       const del = e.target.closest('[data-del-chat]'); if (del) { e.stopPropagation(); chats = chats.filter((c) => c.id !== del.dataset.delChat); if (curChat && curChat.id === del.dataset.delChat) curChat = null; saveChats(); renderChat(); return; }
       const c = e.target.closest('[data-chat]'); if (c) { curChat = chats.find((x) => x.id === c.dataset.chat) || null; renderChat(); return; }
       const p = e.target.closest('[data-prompt]'); if (p) { aiSend(p.dataset.prompt); return; }
       const cp = e.target.closest('[data-copy]'); if (cp) { const msg = curChat && curChat.msgs[+cp.dataset.copy]; if (msg) navigator.clipboard?.writeText(msg.content).then(() => toast('Copied'), () => toast('Copy blocked by the browser', 'x')); }
+      const rg = e.target.closest('[data-regen]'); if (rg && curChat && !aiBusy) { const lastUser = [...curChat.msgs].reverse().find((m) => m.role === 'user'); curChat.msgs = curChat.msgs.slice(0, curChat.msgs.lastIndexOf(lastUser)); if (lastUser) aiSend(lastUser.content); }
     });
-    aiRoot.addEventListener('change', (e) => { if (e.target.matches('[data-ollama-model]')) { ollamaModel = e.target.value; store.set('ollamaModel', ollamaModel); renderAITop(); } });
     renderChat(); renderAITop();
   }
   function md(src) {
@@ -585,18 +574,19 @@
   }
   function msgHTML(m, i, streaming) {
     if (m.role === 'user') return `<div class="msg user"><div class="bubble">${md(m.content)}</div></div>`;
-    const think = m.think && S.showThinking ? `<details class="think"${streaming && m.thinking ? ' open' : ''}><summary>${streaming && m.thinking ? 'Thinking…' : 'Thought process'}</summary><div>${esc(m.think)}</div></details>` : '';
+    const think = m.think ? `<details class="think"${streaming && m.thinking ? ' open' : ''}><summary>${streaming && m.thinking ? 'Thinking…' : 'Thought process'}</summary><div>${esc(m.think)}</div></details>` : '';
     const body = m.error ? `<span style="color:var(--danger)">${esc(m.error)}</span>` : md(m.content || '');
+    const waiting = streaming && !m.think && !m.content ? '<span class="ai-wait">Waking up the model…</span>' : '';
     const caret = streaming && !m.thinking ? '<span class="caret"></span>' : '';
-    const meta = !streaming && !m.error ? `<div class="meta"><button class="icon-btn" data-copy="${i}" title="Copy">${ic('copy')}</button><span>${esc(m.model || '')}${m.stats && m.stats.tokens ? ` · ${m.stats.tokens} tokens in ${(m.stats.ms / 1000).toFixed(1)}s` : ''}</span></div>` : '';
-    return `<div class="msg bot"><div class="bubble">${think}${body || (streaming && !m.thinking ? '' : '')}${caret}</div>${meta}</div>`;
+    const meta = !streaming ? `<div class="meta">${!m.error ? `<button class="icon-btn" data-copy="${i}" title="Copy">${ic('copy')}</button>` : ''}<button class="icon-btn" data-regen title="Try again">${ic('refresh')}</button><span>${m.stats && m.stats.tokens ? `${m.stats.tokens} tokens in ${(m.stats.ms / 1000).toFixed(1)}s` : ''}</span></div>` : '';
+    return `<div class="msg bot"><div class="bubble">${think}${waiting}${body}${caret}</div>${meta}</div>`;
   }
   function renderChat(streamIdx) {
     if (!aiRoot) return;
     const list = $('.ai-chats', aiRoot), box = $('.ai-msgs', aiRoot);
     list.innerHTML = chats.map((c) => `<div class="ai-chat-item${curChat && c.id === curChat.id ? ' active' : ''}" data-chat="${c.id}"><span>${esc(c.title)}</span><button class="icon-btn" data-del-chat="${c.id}" title="Delete chat">${ic('trash')}</button></div>`).join('');
     if (!curChat || !curChat.msgs.length) {
-      box.innerHTML = `<div class="ai-welcome"><h2>Ask anything.</h2><p>Pick “My PC” to run DeepSeek on your own computer over Tailscale, or use one of the free cloud models.</p>
+      box.innerHTML = `<div class="ai-welcome"><h2>Ask anything.</h2><p>Unity AI thinks before it answers, so the first reply can take a few seconds.</p>
         <div class="ai-prompts">${['Explain how ocean caustics form', 'Help me study for a biology quiz', 'Write a short story about a lighthouse', 'Give me 5 tips for Retro Bowl'].map((p) => `<button data-prompt="${esc(p)}">${esc(p)}</button>`).join('')}</div></div>`;
       return;
     }
@@ -607,18 +597,14 @@
     if (aiBusy) return;
     if (!curChat) { curChat = { id: uid(), title: text.slice(0, 48), msgs: [], t: Date.now() }; chats.unshift(curChat); }
     curChat.msgs.push({ role: 'user', content: text });
-    const modelDef = MODELS.find((m) => m.id === aiModel) || MODELS[1];
-    const useOllama = modelDef.provider === 'ollama';
-    const oName = ollamaModel || (aiStatus.ollama && aiStatus.ollama.model) || 'deepseek-r1:7b';
-    const bot = { role: 'assistant', content: '', think: '', model: useOllama ? oName : modelDef.label, raw: '' };
+    const bot = { role: 'assistant', content: '', think: '', raw: '' };
     curChat.msgs.push(bot);
     const idx = curChat.msgs.length - 1;
     renderChat(idx);
-    const msgs = [{ role: 'system', content: S.systemPrompt }, ...curChat.msgs.slice(0, -1).filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content }))];
+    const msgs = [{ role: 'system', content: SYSTEM }, ...curChat.msgs.slice(0, -1).filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content }))];
     const ctrl = new AbortController(); aiBusy = ctrl;
     const btn = $('form .btn.primary', aiRoot); btn.innerHTML = ic('stop'); btn.title = 'Stop';
-    let thinkStream = '';
-    let finished = false;
+    let thinkStream = '', finished = false, rafPending = false;
     const update = (force) => {
       if (finished && !force) return;
       const sp = splitThink(bot.raw || '');
@@ -628,14 +614,10 @@
       if (last) { const tmp = document.createElement('div'); tmp.innerHTML = msgHTML(bot, idx, true); last.replaceWith(tmp.firstElementChild); }
       box.scrollTop = box.scrollHeight;
     };
-    let rafPending = false;
     const schedule = () => { if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; update(); }); } };
     try {
-      let res;
-      const direct = useOllama && S.ollamaDirect;
-      if (direct) res = await fetch(S.ollamaDirect.replace(/\/+$/, '') + '/api/chat', { method: 'POST', body: JSON.stringify({ model: oName, messages: msgs, stream: true }), signal: ctrl.signal });
-      else res = await fetch('/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: modelDef.provider, model: useOllama ? oName : modelDef.id, messages: msgs }), signal: ctrl.signal });
-      if (!res.ok && !res.body) throw new Error('HTTP ' + res.status);
+      const res = await fetch('/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: msgs }), signal: ctrl.signal });
+      if (!res.body) throw new Error('HTTP ' + res.status);
       const reader = res.body.getReader(), dec = new TextDecoder();
       let buf = '';
       for (;;) {
@@ -645,26 +627,20 @@
         while ((i = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!line) continue;
           let j; try { j = JSON.parse(line); } catch { continue; }
-          if (direct) {
-            if (j.error) bot.error = j.error;
-            if (j.message && j.message.thinking) thinkStream += j.message.thinking;
-            if (j.message && j.message.content) bot.raw += j.message.content;
-            if (j.done) bot.stats = { tokens: j.eval_count, ms: Math.round((j.total_duration || 0) / 1e6) };
-          } else {
-            if (j.error) bot.error = j.error;
-            if (j.k === 'think') thinkStream += j.d; else if (j.d) bot.raw += j.d;
-            if (j.done && j.stats) bot.stats = j.stats;
-          }
+          if (j.error) bot.error = j.error;
+          if (j.k === 'think') thinkStream += j.d; else if (j.d) bot.raw += j.d;
+          if (j.done && j.stats) bot.stats = j.stats;
           schedule();
         }
       }
       if (!bot.raw && !bot.error && !thinkStream) bot.error = 'No response. Try again.';
     } catch (e) {
       if (e.name === 'AbortError') { if (!bot.raw) bot.error = 'Stopped.'; }
-      else bot.error = useOllama ? `Couldn't reach your PC (${e.message}). Check Tailscale and that Ollama is running.` : 'Network error. Is the server running?';
+      else bot.error = 'Network error. Check your connection and try again.';
     }
     update(true); finished = true;
     bot.thinking = false; delete bot.raw;
+    if (bot.error) refreshAIStatus();
     aiBusy = null; btn.innerHTML = ic('send'); btn.title = 'Send (Enter)';
     curChat.t = Date.now(); saveChats(); renderChat();
   }
@@ -687,7 +663,6 @@
       else el.value = S[k] || '';
     });
     if (pane) switchPane(pane);
-    renderAIStatusBox(); refreshAIStatus();
   }
   function switchPane(p) { $$('.set-nav [data-pane]').forEach((b) => b.classList.toggle('active', b.dataset.pane === p)); $$('.set-body .pane').forEach((b) => b.classList.toggle('active', b.dataset.pane === p)); }
   $('#settings').addEventListener('click', (e) => {
@@ -695,13 +670,12 @@
     const nav = e.target.closest('.set-nav [data-pane]'); if (nav) { switchPane(nav.dataset.pane); return; }
     const sw = e.target.closest('.switch[data-setting]'); if (sw) { const k = sw.dataset.setting; setSetting(k, !S[k]); sw.classList.toggle('on', !!S[k]); return; }
     const seg = e.target.closest('.seg button'); if (seg) { const k = seg.parentNode.dataset.setting; setSetting(k, seg.dataset.v); $$('button', seg.parentNode).forEach((b) => b.classList.toggle('on', b === seg)); return; }
-    const th = e.target.closest('[data-theme]'); if (th) { setSetting('theme', th.dataset.theme); $$('.theme-card').forEach((c) => c.classList.toggle('on', c === th)); return; }
+    const th = e.target.closest('[data-theme]'); if (th) { if (S.autoTheme) { setSetting('autoTheme', false); $('[data-setting="autoTheme"]').classList.remove('on'); } setSetting('theme', th.dataset.theme); $$('.theme-card').forEach((c) => c.classList.toggle('on', c === th)); return; }
     const ck = e.target.closest('[data-cloak]'); if (ck) { setSetting('cloakTitle', ck.dataset.cloak); setSetting('cloakIcon', ck.dataset.cloakIcon); $('[data-setting="cloakTitle"]').value = S.cloakTitle; $('[data-setting="cloakIcon"]').value = S.cloakIcon; toast('Tab disguise applied'); return; }
-    if (e.target.closest('[data-ai-recheck]')) { refreshAIStatus(); }
   });
   $$('#settings input[data-setting]').forEach((el) => el.addEventListener('change', () => {
     let v = el.value.trim(); if (el.dataset.setting === 'panicKey') v = (v || 'y').toLowerCase();
-    setSetting(el.dataset.setting, v); if (el.dataset.setting === 'ollamaDirect') refreshAIStatus();
+    setSetting(el.dataset.setting, v);
   }));
 
   /* data actions */
@@ -808,17 +782,138 @@
   }
   function randomGame() { const g = GAMES[Math.floor(Math.random() * GAMES.length)]; if (g) { toast(`Rolling the dice: ${g.name}`, 'shuffle'); play(g.id); } }
 
+  /* ───────── add-a-game dialog + card menu ───────── */
+  function openGameDialog() {
+    const sel = $('#game-form [name=cat]');
+    const cats = [...new Set(['My games', ...GAMES.map((g) => g.cat)])];
+    sel.innerHTML = cats.map((c) => `<option>${esc(c)}</option>`).join('');
+    $('#game-dlg').hidden = false; setTimeout(() => $('#game-form [name=name]').focus(), 20);
+  }
+  $('#game-dlg').addEventListener('click', (e) => { if (e.target.id === 'game-dlg' || e.target.closest('[data-close]')) $('#game-dlg').hidden = true; });
+  $('#game-form').addEventListener('submit', (e) => {
+    e.preventDefault(); const f = e.target, n = f.name.value.trim(), u = resolveInput(f.url.value);
+    if (!n || !u) return; addCustomGame(n, u, f.cat.value); f.reset(); $('#game-dlg').hidden = true;
+  });
+  function showMenu(x, y, items) {
+    const m = $('#ctx-menu');
+    m.innerHTML = items.map((it, i) => (it ? `<button data-mi="${i}">${ic(it[1])}${esc(it[0])}</button>` : '<hr>')).join('');
+    m.hidden = false;
+    const r = m.getBoundingClientRect();
+    m.style.left = Math.min(x, innerWidth - r.width - 8) + 'px'; m.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + 'px';
+    m.onclick = (e) => { const b = e.target.closest('[data-mi]'); if (!b) return; m.hidden = true; items[+b.dataset.mi][2](); };
+  }
+  document.addEventListener('pointerdown', (e) => { if (!$('#ctx-menu').hidden && !e.target.closest('#ctx-menu')) $('#ctx-menu').hidden = true; });
+  document.addEventListener('contextmenu', (e) => {
+    const card = e.target.closest('.gcard[data-play]'); if (!card) return;
+    e.preventDefault();
+    const id = card.dataset.play, g = GBY.get(id); if (!g) return;
+    const items = [['Play', 'play', () => play(id, card.closest('#desktop') ? 'desktop' : null)], [isFav(id) ? 'Remove from favorites' : 'Add to favorites', 'star', () => toggleFav(id)], ['Copy link', 'copy', () => navigator.clipboard?.writeText(g.url).then(() => toast('Link copied'))]];
+    if (g.custom) items.push(null, ['Remove from library', 'trash', () => removeCustomGame(id)]);
+    showMenu(e.clientX, e.clientY, items);
+  });
+
+  /* ───────── accounts + sync ───────── */
+  const SYNC_KEYS = ['settings', 'favs', 'plays', 'shortcuts', 'hiddenBuiltins', 'notes', 'chats', 'libSort', 'customGames'];
+  let acct = store.get('account', null), syncT = null, syncing = false, syncErr = '', lastSync = store.get('syncAt', 0), acctMode = 'login';
+  async function api(path, opts = {}) {
+    const r = await fetch('/api/account' + path, { method: opts.method || 'GET', headers: Object.assign({ 'Content-Type': 'application/json' }, acct ? { Authorization: 'Bearer ' + acct.token } : {}), body: opts.body ? JSON.stringify(opts.body) : undefined });
+    let j = {}; try { j = await r.json(); } catch {}
+    if (!r.ok) { if (r.status === 401 && acct && !/login|signup/.test(path)) signedOut(); throw new Error(j.error || 'Something went wrong (' + r.status + ').'); }
+    return j;
+  }
+  const collect = () => { const d = {}; SYNC_KEYS.forEach((k) => { const v = store.get(k); if (v !== undefined) d[k] = v; }); return d; };
+  async function pushSync() {
+    if (!acct) return; syncing = true; renderAcct();
+    try { const r = await api('/data', { method: 'PUT', body: { data: collect() } }); lastSync = r.updatedAt; localStorage.setItem('u3.syncAt', JSON.stringify(lastSync)); syncErr = ''; }
+    catch (e) { syncErr = e.message; }
+    syncing = false; renderAcct();
+  }
+  store.onChange = (k) => { if (acct && SYNC_KEYS.includes(k)) { clearTimeout(syncT); syncT = setTimeout(pushSync, 1500); } };
+  function applyRemote(r) {
+    SYNC_KEYS.forEach((k) => { try { if (r.data[k] !== undefined) localStorage.setItem('u3.' + k, JSON.stringify(r.data[k])); } catch {} });
+    localStorage.setItem('u3.syncAt', JSON.stringify(r.updatedAt));
+    try { sessionStorage.setItem('u3.synced', String(r.updatedAt)); } catch {}
+    location.reload();
+  }
+  async function pullSync() {
+    if (!acct) return;
+    try {
+      const r = await api('/data');
+      let guard = ''; try { guard = sessionStorage.getItem('u3.synced'); } catch {}
+      if (r.data && r.updatedAt > lastSync && guard !== String(r.updatedAt)) return applyRemote(r);
+      if (!r.data) pushSync();
+      renderAcct();
+    } catch (e) { syncErr = e.message; renderAcct(); }
+  }
+  function signedOut() { acct = null; store.del('account'); renderAcct(); toast('You were signed out. Sign in again to keep syncing.', 'user'); }
+  const avatarHTML = (name) => { if (!name) return ic('user'); let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360; return `<span style="background:hsl(${h} 55% 45%)">${esc(name[0].toUpperCase())}</span>`; };
+  function renderAcct() {
+    const name = acct && acct.username;
+    $('#acct-btn').innerHTML = avatarHTML(name); $('#acct-btn').title = name ? `Signed in as ${name}` : 'Sign in';
+    $('#acct-btn').classList.toggle('in', !!name);
+    $('#sm-avatar').innerHTML = avatarHTML(name); $('#sm-username').textContent = name || 'Sign in';
+    $('#acct-out').hidden = !!name; $('#acct-in').hidden = !name;
+    if (name) {
+      $('#acct-avatar-big').innerHTML = avatarHTML(name); $('#acct-name').textContent = name;
+      $('#acct-sync').textContent = syncing ? 'Syncing…' : syncErr ? syncErr : lastSync ? `Synced ${timeAgo(lastSync)}` : 'Not synced yet';
+    }
+    const hint = $('#data-acct-hint'), b = $('#data-acct-btn');
+    if (hint) { hint.textContent = name ? `Signed in as ${name}. Changes sync automatically.` : 'Sign in to keep your favorites, settings, shortcuts, notes, chats and added games on every device.'; b.textContent = name ? 'Manage account' : 'Sign in or create an account'; }
+  }
+  function openAccount() {
+    $('#account-dlg').hidden = false; $('#acct-err').hidden = $('#acct-err2').hidden = true; $('#pw-form').hidden = true; renderAcct();
+    if (!acct) setTimeout(() => $('#acct-form [name=username]').focus(), 20);
+  }
+  function setAcctMode(m) {
+    acctMode = m; $$('.acct-seg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
+    $('#acct-title').textContent = m === 'login' ? 'Sign in to Unity' : 'Create your Unity account';
+    $('#acct-submit').textContent = m === 'login' ? 'Sign in' : 'Create account';
+    $('#acct-form [name=password]').autocomplete = m === 'login' ? 'current-password' : 'new-password';
+  }
+  const showErr = (el, msg) => { el.textContent = msg; el.hidden = !msg; };
+  $('#account-dlg').addEventListener('click', async (e) => {
+    if (e.target.id === 'account-dlg' || e.target.closest('[data-close]')) { $('#account-dlg').hidden = true; return; }
+    const m = e.target.closest('[data-mode]'); if (m) { setAcctMode(m.dataset.mode); return; }
+    const a = e.target.closest('[data-acct]'); if (!a) return;
+    if (a.dataset.acct === 'sync') { await pushSync(); if (!syncErr) toast('Synced'); }
+    if (a.dataset.acct === 'password') { $('#pw-form').hidden = !$('#pw-form').hidden; }
+    if (a.dataset.acct === 'logout') { try { await api('/logout', { method: 'POST' }); } catch {} acct = null; store.del('account'); renderAcct(); toast('Signed out. Your data stays in this browser.', 'user'); }
+  });
+  $('#acct-form').addEventListener('submit', async (e) => {
+    e.preventDefault(); const f = e.target; showErr($('#acct-err'), '');
+    $('#acct-submit').disabled = true;
+    try {
+      const r = await api('/' + acctMode, { method: 'POST', body: { username: f.username.value, password: f.password.value } });
+      acct = { token: r.token, username: r.username }; store.set('account', acct); f.reset();
+      const d = await api('/data');
+      if (d.data && acctMode === 'login') { toast(`Welcome back, ${r.username}. Loading your stuff…`, 'user'); return applyRemote(d); }
+      await pushSync(); renderAcct(); toast(acctMode === 'login' ? `Signed in as ${r.username}` : `Account created. Everything here now syncs.`, 'user');
+    } catch (err) { showErr($('#acct-err'), err.message); }
+    $('#acct-submit').disabled = false;
+  });
+  $('#pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault(); const f = e.target;
+    try { await api('/password', { method: 'POST', body: { current: f.current.value, next: f.next.value } }); f.reset(); f.hidden = true; toast('Password changed'); showErr($('#acct-err2'), ''); }
+    catch (err) { showErr($('#acct-err2'), err.message); }
+  });
+  $('#del-form').addEventListener('submit', async (e) => {
+    e.preventDefault(); if (!confirm('Delete your Unity account and its synced data? This browser keeps its local copy.')) return;
+    try { await api('/delete', { method: 'POST', body: { password: e.target.password.value } }); acct = null; store.del('account'); renderAcct(); $('#account-dlg').hidden = true; toast('Account deleted', 'trash'); }
+    catch (err) { showErr($('#acct-err2'), err.message); }
+  });
+  setInterval(() => { if (acct && !$('#account-dlg').hidden) renderAcct(); }, 30000);
+
   /* ───────── ocean visibility ───────── */
   let oceanCovered = false;
   function updateOcean() {
-    if (mode === 'browser') oceanCovered = typeof active === 'number';
+    if (mode === 'browser') oceanCovered = active !== 'home';
     else oceanCovered = window.Desktop ? Desktop.covered() : false;
     Water.setPaused(S.reduceMotion || (S.pauseBehind && oceanCovered));
   }
 
   /* ───────── global clicks / keys ───────── */
   const ACTS = {
-    home: () => showView('home'), newtab: () => newTab(), back: navBack, forward: navForward, reload: navReload,
+    home: () => showView('home'), newtab: () => newTab(), account: openAccount, 'show-desktop': () => window.Desktop && Desktop.showDesktop(), back: navBack, forward: navForward, reload: navReload,
     fullscreen: toggleFullscreen, palette: openPalette, console: toggleConsole, settings: () => openSettings(), panic,
     desktop: () => setMode('desktop'), 'browser-mode': () => setMode('browser'),
     'add-shortcut': () => { $('#shortcut-dlg').hidden = false; setTimeout(() => $('#shortcut-form [name=name]').focus(), 20); },
@@ -866,6 +961,8 @@
       if (!$('#palette').hidden) return closePalette();
       if (!$('#settings').hidden) { $('#settings').hidden = true; return; }
       if (!$('#shortcut-dlg').hidden) { $('#shortcut-dlg').hidden = true; return; }
+      for (const id of ['#account-dlg', '#game-dlg']) if (!$(id).hidden) { $(id).hidden = true; return; }
+      if (!$('#ctx-menu').hidden) { $('#ctx-menu').hidden = true; return; }
       if (!$('#console').hidden) { $('#console').hidden = true; return; }
       if (window.Desktop && mode === 'desktop') Desktop.escape();
       return;
@@ -895,17 +992,18 @@
 
   /* ───────── boot ───────── */
   hydrateIcons();
-  Water.init($('#water'), $('#sea'));
+  Water.init($('#water'), $('#life'));
   applyTheme();
   ['quality', 'density', 'ocean', 'fish', 'bubbles', 'kelp', 'fps', 'reduceMotion', 'cloakTitle'].forEach(applySetting);
   renderHome(); renderTabs(); tickClocks();
   setInterval(tickClocks, 15000);
-  on('setting', (k) => { if (k === 'showThinking') renderChat(); });
+  setInterval(() => { if (S.autoTheme && themeKey() !== appliedTheme) applyTheme(); }, 60000);
+  renderAcct(); pullSync();
 
   window.Unity = {
     $, $$, esc, ic, hydrateIcons, bus, on, emit, store, S, setSetting, THEMES, toast,
     GAMES, GBY, isFav, toggleFav, recordPlay, recentIds, artVars, letters, gameCard, Library, favs: () => favs,
-    shortcuts, hostOf, favicon: fav, resolveInput, isAd, navigate, play, addHistory, suggest, suggIcon, bindSuggest, pickSuggestion,
+    shortcuts, hostOf, showMenu, openAccount, openGameDialog, removeCustomGame, favicon: fav, resolveInput, isAd, navigate, play, addHistory, suggest, suggIcon, bindSuggest, pickSuggestion,
     mountAI, mountMovies, makeFrame, openSettings, openPalette, panic, setMode, get mode() { return mode; }, updateOcean, randomGame, toggleFullscreen,
     greetingText,
   };

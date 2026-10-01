@@ -12,7 +12,7 @@
 </head>
 <body>
 <canvas id="water" aria-hidden="true"></canvas>
-<canvas id="sea" aria-hidden="true"></canvas>
+<canvas id="life" aria-hidden="true"></canvas>
 <div id="fps" hidden></div>
 <div id="progress"></div>
 
@@ -30,6 +30,7 @@
         <button data-view="movies"><span data-icon="film"></span><span>Movies</span></button>
       </nav>
       <button class="icon-btn mode-btn" data-act="desktop" title="Switch to desktop mode (Alt+D)"><span data-icon="monitor"></span><span class="mode-lbl">Desktop</span></button>
+      <button class="acct-btn" data-act="account" title="Account" id="acct-btn"></button>
     </div>
     <div class="navrow">
       <button class="icon-btn" data-act="back" title="Back" data-icon="left"></button>
@@ -104,7 +105,7 @@
     <div class="sm-search"><span data-icon="search"></span><input id="sm-input" placeholder="Search apps, games and the web" autocomplete="off"></div>
     <div class="sm-body" id="sm-body"></div>
     <div class="sm-foot">
-      <div class="sm-user"><span class="brand-mark" data-icon="logo"></span><span>Unity</span></div>
+      <button class="sm-user" data-act="account"><span class="acct-avatar" id="sm-avatar"></span><span id="sm-username">Sign in</span></button>
       <button class="icon-btn" data-act="settings" title="Settings" data-icon="sliders"></button>
       <button class="icon-btn" data-act="browser-mode" title="Back to browser mode" data-icon="power"></button>
     </div>
@@ -114,13 +115,15 @@
     <div id="tb-apps"></div>
     <div class="grow"></div>
     <div id="tray">
+      <button class="tb-exit" data-act="browser-mode" title="Leave desktop mode"><span data-icon="power"></span><span>Exit desktop</span></button>
       <button class="icon-btn tray-btn" data-act="palette" title="Search (Ctrl+K)" data-icon="search"></button>
       <button class="icon-btn tray-btn danger" data-act="panic" title="Panic (Alt+Y)" data-icon="zap"></button>
-      <button class="tray-clock" id="tray-clock" data-act="calendar"></button>
+      <button class="tray-clock" id="tray-clock"></button>
+      <button class="show-desk" data-act="show-desktop" title="Show desktop"></button>
     </div>
   </footer>
-  <div id="ctx-menu" class="menu" hidden></div>
 </div>
+<div id="ctx-menu" class="menu" hidden></div>
 
 <!-- ═════════════ OVERLAYS ═════════════ -->
 <div class="scrim" id="settings" hidden>
@@ -129,7 +132,6 @@
       <h2 id="set-title">Settings</h2>
       <button class="active" data-pane="look">Look &amp; feel</button>
       <button data-pane="ocean">Ocean</button>
-      <button data-pane="ai">AI</button>
       <button data-pane="privacy">Privacy</button>
       <button data-pane="keys">Keyboard</button>
       <button data-pane="data">Your data</button>
@@ -141,6 +143,7 @@
         <h3>Theme</h3>
         <p class="hint">Each theme changes the water, the light and the accent colour.</p>
         <div class="theme-grid" id="theme-grid"></div>
+        <div class="row"><div><b>Change with the time of day</b><span>Lagoon in the morning, Reef by day, Dusk in the evening, Abyss at night.</span></div><button class="switch" data-setting="autoTheme"></button></div>
         <h3>Layout</h3>
         <div class="row"><div><b>Start in desktop mode</b><span>Open Unity as a desktop with windows and a taskbar.</span></div><button class="switch" data-setting="startDesktop"></button></div>
         <div class="row"><div><b>24-hour clock</b></div><button class="switch" data-setting="clock24"></button></div>
@@ -165,17 +168,6 @@
         <div class="row"><div><b>Show frame rate</b></div><button class="switch" data-setting="fps"></button></div>
       </div>
 
-      <div class="pane" data-pane="ai">
-        <h3>Your PC (Ollama over Tailscale)</h3>
-        <div class="ai-status" id="ai-status-box">Checking…</div>
-        <p class="hint">The server relays chat to the Ollama on your PC. Set <code>OLLAMA_URL</code> (and <code>TS_AUTHKEY</code> to join your tailnet) in Railway — see the README.</p>
-        <h3>Direct connection (optional)</h3>
-        <p class="hint">If this device is on your tailnet, it can talk to Ollama directly instead of through the server. Use an <code>https://…ts.net</code> address from <code>tailscale serve</code>, and set <code>OLLAMA_ORIGINS=*</code> on the PC.</p>
-        <div class="row"><div><b>Direct Ollama URL</b><span>Leave empty to use the server relay.</span></div><input class="field" data-setting="ollamaDirect" placeholder="https://my-pc.tail1234.ts.net"></div>
-        <div class="row"><div><b>Show model thinking</b><span>DeepSeek-R1 reasons before answering. Show that as a collapsible block.</span></div><button class="switch" data-setting="showThinking"></button></div>
-        <div class="row"><div><b>System prompt</b></div><input class="field wide" data-setting="systemPrompt"></div>
-      </div>
-
       <div class="pane" data-pane="privacy">
         <h3>Tab disguise</h3>
         <p class="hint">Changes the title and icon shown on the browser tab.</p>
@@ -195,8 +187,11 @@
       </div>
 
       <div class="pane" data-pane="data">
+        <h3>Account</h3>
+        <p class="hint" id="data-acct-hint">Sign in to keep your favorites, settings, shortcuts, notes, chats and added games on every device.</p>
+        <div class="btn-row"><button class="btn primary" data-act="account" id="data-acct-btn">Sign in or create an account</button></div>
         <h3>Your data</h3>
-        <p class="hint">Favorites, play history, shortcuts, notes, chats and settings are stored in this browser only.</p>
+        <p class="hint">Everything is also kept in this browser, so Unity works without an account.</p>
         <div class="btn-row">
           <button class="btn" data-act="export">Export backup</button>
           <button class="btn" data-act="import">Import backup</button>
@@ -229,6 +224,47 @@
   </form>
 </div>
 
+<div class="scrim" id="account-dlg" hidden>
+  <div class="dialog small account" role="dialog" aria-modal="true" aria-labelledby="acct-title">
+    <div id="acct-out">
+      <h2 id="acct-title">Sign in to Unity</h2>
+      <p class="hint">Your favorites, settings, shortcuts, notes, AI chats and added games follow you to any device.</p>
+      <div class="seg acct-seg"><button class="on" data-mode="login">Sign in</button><button data-mode="signup">Create account</button></div>
+      <form id="acct-form" autocomplete="on">
+        <label>Username<input class="field" name="username" autocomplete="username" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+"></label>
+        <label>Password<input class="field" name="password" type="password" autocomplete="current-password" required minlength="6"></label>
+        <p class="form-err" id="acct-err" hidden></p>
+        <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" type="submit" id="acct-submit">Sign in</button></div>
+      </form>
+    </div>
+    <div id="acct-in" hidden>
+      <div class="acct-head"><span class="acct-avatar big" id="acct-avatar-big"></span><div><h2 id="acct-name"></h2><span class="hint" id="acct-sync"></span></div></div>
+      <div class="btn-row"><button class="btn" data-acct="sync">Sync now</button><button class="btn" data-acct="password">Change password</button><button class="btn" data-acct="logout">Sign out</button></div>
+      <form id="pw-form" hidden>
+        <label>Current password<input class="field" name="current" type="password" autocomplete="current-password" required></label>
+        <label>New password<input class="field" name="next" type="password" autocomplete="new-password" required minlength="6"></label>
+        <div class="btn-row end"><button class="btn primary" type="submit">Change password</button></div>
+      </form>
+      <details class="danger-zone"><summary>Delete account</summary>
+        <form id="del-form"><label>Password<input class="field" name="password" type="password" required></label><div class="btn-row end"><button class="btn danger" type="submit">Delete my account</button></div></form>
+      </details>
+      <p class="form-err" id="acct-err2" hidden></p>
+      <div class="btn-row end"><button class="btn" data-close>Done</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="game-dlg" hidden>
+  <form class="dialog small" id="game-form" role="dialog" aria-modal="true" aria-labelledby="gd-title">
+    <h2 id="gd-title">Add a game</h2>
+    <p class="hint">Any game that can be embedded works. It shows up in your library and syncs with your account.</p>
+    <label>Name<input class="field" name="name" maxlength="40" required></label>
+    <label>Address<input class="field" name="url" required placeholder="https://…"></label>
+    <label>Category<select class="field" name="cat"></select></label>
+    <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" type="submit">Add game</button></div>
+  </form>
+</div>
+
 <div id="console" class="drawer" hidden>
   <div class="drawer-head"><b>Console</b><span class="hint">Runs JavaScript in the current tab when it allows it, otherwise here.</span><button class="icon-btn" data-act="console" data-icon="x" title="Close"></button></div>
   <div id="con-out"></div>
@@ -239,7 +275,7 @@
 <div id="toasts" aria-live="polite"></div>
 
 <script src="/js/games.js"></script>
-<script src="/js/sea.js"></script>
+<script src="/js/reef.js"></script>
 <script src="/js/water.js"></script>
 <script src="/js/app.js"></script>
 <script src="/js/desktop.js"></script>

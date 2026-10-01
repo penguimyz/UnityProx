@@ -11,16 +11,16 @@ const PORT = process.env.PORT || 3000;
 /* ── Ollama config ─────────────────────────────────────────────
    OLLAMA_URL     where Ollama lives, e.g. http://100.101.102.103:11434 (Tailscale IP)
                   or https://my-pc.tail1234.ts.net (Tailscale Funnel)
-   OLLAMA_MODEL   default model (deepseek-r1:7b)
    TS_AUTHKEY     if set, start.sh joins your tailnet and exposes an HTTP proxy on :1055
    TS_HTTP_PROXY  override the proxy address (defaults to http://127.0.0.1:1055 when TS_AUTHKEY is set)
    OLLAMA_AUTH    optional Authorization header value (if you put Ollama behind an auth proxy) */
 const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/+$/, '');
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'deepseek-r1:7b';
+const OLLAMA_MODEL = 'deepseek-r1:7b'; // the only model Unity uses
 const TS_PROXY = process.env.TS_HTTP_PROXY || (process.env.TS_AUTHKEY ? 'http://127.0.0.1:1055' : '');
 const OLLAMA_AUTH = process.env.OLLAMA_AUTH || '';
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1); // Railway sits behind a proxy; needed for per-IP rate limits
 app.use((_req, res, next) => { res.removeHeader('Server'); next(); });
 app.use(express.json({ limit: '2mb' }));
 
@@ -72,12 +72,13 @@ async function ollamaStatus() {
 }
 
 app.get('/ai/status', async (_req, res) => {
-  res.json({ ollama: await ollamaStatus(), pollinations: true });
+  const o = await ollamaStatus();
+  res.json({ configured: o.configured, online: o.online && (!o.models.length || o.models.includes(OLLAMA_MODEL)), model: OLLAMA_MODEL, missingModel: o.online && o.models.length > 0 && !o.models.includes(OLLAMA_MODEL) });
 });
 
 /* ── AI relay — streams NDJSON lines: {d:"text"} {k:"think",d:"…"} {done:true} {error:"…"} ── */
 app.post('/ai', rateLimit({ windowMs: 60000, max: 40 }), async (req, res) => {
-  const { provider = 'pollinations', model, messages = [] } = req.body || {};
+  const { messages = [] } = req.body || {};
   const msgs = (Array.isArray(messages) ? messages : [])
     .filter((m) => m && typeof m.content === 'string' && ['system', 'user', 'assistant'].includes(m.role))
     .slice(-40)
@@ -90,74 +91,44 @@ app.post('/ai', rateLimit({ windowMs: 60000, max: 40 }), async (req, res) => {
   res.flushHeaders();
   const send = (o) => res.write(JSON.stringify(o) + '\n');
 
-  if (provider === 'ollama') {
-    let upstream;
-    let closed = false;
-    res.on('close', () => { closed = true; if (upstream) upstream.destroy(); });
-    try {
-      upstream = await ollamaRequest('POST', '/api/chat', {
-        model: model || OLLAMA_MODEL, messages: msgs, stream: true, keep_alive: '30m',
-      });
-    } catch (e) {
-      send({ error: `Can't reach your Ollama server (${e.message}). Check that the PC is on and connected to Tailscale.` });
-      return res.end();
-    }
-    if (upstream.statusCode !== 200) {
-      const txt = await readAll(upstream);
-      let msg = txt; try { msg = JSON.parse(txt).error || txt; } catch {}
-      send({ error: `Ollama returned ${upstream.statusCode}: ${String(msg).slice(0, 300)}` });
-      return res.end();
-    }
-    let buf = '';
-    upstream.setEncoding('utf8');
-    upstream.on('data', (chunk) => {
-      buf += chunk;
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line) continue;
-        try {
-          const j = JSON.parse(line);
-          if (j.error) send({ error: j.error });
-          if (j.message?.thinking) send({ k: 'think', d: j.message.thinking });
-          if (j.message?.content) send({ d: j.message.content });
-          if (j.done) send({ done: true, stats: { tokens: j.eval_count, ms: Math.round((j.total_duration || 0) / 1e6) } });
-        } catch {}
-      }
-    });
-    upstream.on('end', () => { if (!closed) res.end(); });
-    upstream.on('error', (e) => { if (!closed) { send({ error: e.message }); res.end(); } });
-    return;
-  }
-
-  // Pollinations (no key)
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  let upstream;
+  let closed = false;
+  res.on('close', () => { closed = true; if (upstream) upstream.destroy(); });
   try {
-    const r = await fetch('https://text.pollinations.ai/openai', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: model || 'openai', messages: msgs, private: true }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!r.ok) {
-      const txt = await r.text().catch(() => '');
-      console.error('[ai] upstream error', r.status, txt.slice(0, 200));
-      send({ error: `The AI service returned ${r.status}. Try again in a moment.` });
-      return res.end();
-    }
-    const d = await r.json();
-    const reply = d.choices?.[0]?.message?.content;
-    if (!reply) send({ error: 'No response from the AI. Try again.' });
-    else { send({ d: reply }); send({ done: true }); }
-    res.end();
-  } catch (err) {
-    clearTimeout(timeout);
-    send({ error: err.name === 'AbortError' ? 'AI request timed out. Try again.' : 'Could not reach the AI service. Try again in a moment.' });
-    res.end();
+    upstream = await ollamaRequest('POST', '/api/chat', { model: OLLAMA_MODEL, messages: msgs, stream: true, keep_alive: '30m' });
+  } catch (e) {
+    send({ error: `The AI server can't be reached right now (${e.message}).` });
+    return res.end();
   }
+  if (upstream.statusCode !== 200) {
+    const txt = await readAll(upstream);
+    let msg = txt; try { msg = JSON.parse(txt).error || txt; } catch {}
+    send({ error: `The AI server returned ${upstream.statusCode}: ${String(msg).slice(0, 300)}` });
+    return res.end();
+  }
+  let buf = '';
+  upstream.setEncoding('utf8');
+  upstream.on('data', (chunk) => {
+    buf += chunk;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line) continue;
+      try {
+        const j = JSON.parse(line);
+        if (j.error) send({ error: j.error });
+        if (j.message?.thinking) send({ k: 'think', d: j.message.thinking });
+        if (j.message?.content) send({ d: j.message.content });
+        if (j.done) send({ done: true, stats: { tokens: j.eval_count, ms: Math.round((j.total_duration || 0) / 1e6) } });
+      } catch {}
+    }
+  });
+  upstream.on('end', () => { if (!closed) res.end(); });
+  upstream.on('error', (e) => { if (!closed) { send({ error: e.message }); res.end(); } });
 });
+
+// ── accounts + sync ──────────────────────────────────────────
+require('./accounts')(app, rateLimit);
 
 // ── CORS proxy ───────────────────────────────────────────────
 app.use('/fetch', rateLimit({ windowMs: 60000, max: 300 }), async (req, res) => {
@@ -207,5 +178,5 @@ app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.h
 app.listen(PORT, () => {
   console.log(`unity on :${PORT}`);
   if (OLLAMA_URL) console.log(`[ai] ollama -> ${OLLAMA_URL} (${TS_PROXY ? 'via tailscale proxy ' + TS_PROXY : 'direct'}) model=${OLLAMA_MODEL}`);
-  else console.log('[ai] OLLAMA_URL not set — only the no-key cloud models are available');
+  else console.log('[ai] OLLAMA_URL not set — the AI tab will show as offline');
 });

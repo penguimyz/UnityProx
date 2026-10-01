@@ -9,7 +9,7 @@
   const TILE = {
     browser: 'linear-gradient(140deg,#35c3d1,#1a5f8f)', games: 'linear-gradient(140deg,#f6cf7a,#d97a2b)', ai: 'linear-gradient(140deg,#a596ff,#5340d0)',
     movies: 'linear-gradient(140deg,#ff8f7e,#b8344f)', notes: 'linear-gradient(140deg,#ffe07a,#e3a52a)', calc: 'linear-gradient(140deg,#7b8fa1,#3c4c5c)',
-    terminal: 'linear-gradient(140deg,#3a4a52,#0c1418)', settings: 'linear-gradient(140deg,#9fb3c2,#4d6273)',
+    terminal: 'linear-gradient(140deg,#3a4a52,#0c1418)', timer: 'linear-gradient(140deg,#7ee0b0,#2a9d78)', settings: 'linear-gradient(140deg,#9fb3c2,#4d6273)',
   };
   const APPS = {
     browser: { name: 'Browser', icon: 'browser', size: [1060, 680] },
@@ -19,6 +19,7 @@
     notes: { name: 'Notes', icon: 'note', size: [640, 460], single: true },
     calc: { name: 'Calculator', icon: 'calc', size: [300, 440] },
     terminal: { name: 'Terminal', icon: 'terminal', size: [660, 420] },
+    timer: { name: 'Timer', icon: 'clock', size: [360, 400] },
     settings: { name: 'Settings', icon: 'sliders', launch: () => U.openSettings() },
   };
   const PINNED = ['browser', 'games', 'ai', 'notes', 'terminal'];
@@ -171,6 +172,7 @@
       case 'notes': return openNotes();
       case 'calc': return openCalc();
       case 'terminal': return openTerminal();
+      case 'timer': return openTimer();
     }
   }
 
@@ -274,7 +276,7 @@
       open: (a) => { const u = U.resolveInput(a); if (!u) return out('usage: open <url or search>', 'te'); openBrowser(u); },
       theme: (a) => { if (!a) return out('themes: ' + Object.keys(U.THEMES).join(', ') + '\ncurrent: ' + U.S.theme); const k = Object.keys(U.THEMES).find((t) => t.startsWith(a.toLowerCase())); if (!k) return out('unknown theme', 'te'); U.setSetting('theme', k); out('theme → ' + U.THEMES[k].name); },
       quality: (a) => { if (!['low', 'medium', 'high', 'ultra'].includes(a)) return out('current: ' + U.S.quality + '  (low|medium|high|ultra)'); U.setSetting('quality', a); out('water quality → ' + a); },
-      spawn: (a) => { if (!['shark', 'turtle', 'manta', 'boat'].includes(a)) return out('usage: spawn shark|turtle|manta|boat', 'te'); window.Sea && Sea.spawn(a); out(`a ${a} is on its way…`); },
+      spawn: (a) => { if (!['shark', 'turtle', 'manta', 'boat'].includes(a)) return out('usage: spawn shark|turtle|manta|boat', 'te'); window.Reef && Reef.spawn(a); out(`a ${a} is on its way…`); },
       date: () => out(new Date().toString()),
       echo: (a) => out(a || ''),
       js: (a) => { try { const r = (0, eval)(a); out(typeof r === 'object' ? JSON.stringify(r, null, 2) : String(r)); } catch (e) { out(e.message, 'te'); } },
@@ -297,9 +299,38 @@
     return W;
   }
 
+  let lastShown = [];
+  function openTimer() {
+    const W = createWin({ app: 'timer', size: APPS.timer.size });
+    W.body.insertAdjacentHTML('beforeend', `<div class="timer">
+      <div class="seg tm-seg"><button class="on" data-tm="timer">Timer</button><button data-tm="stopwatch">Stopwatch</button></div>
+      <div class="tm-face">00:00</div>
+      <div class="tm-presets">${[1, 5, 10, 15, 25].map((m) => `<button class="btn" data-min="${m}">${m} min</button>`).join('')}</div>
+      <div class="btn-row" style="justify-content:center"><button class="btn primary" data-tm-go>Start</button><button class="btn" data-tm-reset>Reset</button></div></div>`);
+    const face = $('.tm-face', W.body), go = $('[data-tm-go]', W.body), presets = $('.tm-presets', W.body);
+    let mode = 'timer', total = 5 * 60000, left = total, elapsed = 0, running = false, last = 0, iv = null;
+    const fmt = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0') + (mode === 'stopwatch' ? '.' + String(Math.floor((ms % 1000) / 100)) : ''); };
+    const draw = () => { face.textContent = fmt(mode === 'timer' ? left : elapsed); go.textContent = running ? 'Pause' : 'Start'; setTitle(W, running ? `Timer ${fmt(mode === 'timer' ? left : elapsed)}` : 'Timer'); };
+    const tick = () => {
+      const now = performance.now(), d = now - last; last = now;
+      if (mode === 'timer') { left -= d; if (left <= 0) { left = 0; running = false; clearInterval(iv); U.toast('Time is up', 'clock'); try { const a = new AudioContext(), o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination); o.start(); o.stop(a.currentTime + 0.4); } catch {} } }
+      else elapsed += d;
+      draw();
+    };
+    W.body.addEventListener('click', (e) => {
+      const t = e.target.closest('[data-tm]'); if (t) { mode = t.dataset.tm; $$('[data-tm]', W.body).forEach((b) => b.classList.toggle('on', b === t)); presets.hidden = mode !== 'timer'; running = false; clearInterval(iv); draw(); return; }
+      const p = e.target.closest('[data-min]'); if (p) { total = left = +p.dataset.min * 60000; running = false; clearInterval(iv); draw(); return; }
+      if (e.target.closest('[data-tm-go]')) { running = !running; if (running) { if (mode === 'timer' && left <= 0) left = total; last = performance.now(); iv = setInterval(tick, 100); } else clearInterval(iv); draw(); }
+      if (e.target.closest('[data-tm-reset]')) { running = false; clearInterval(iv); left = total; elapsed = 0; draw(); }
+    });
+    W.onClose = () => clearInterval(iv);
+    left = total; draw();
+    return W;
+  }
+
   /* ───────── desktop surface ───────── */
   const ICONS = () => [
-    ...['browser', 'games', 'ai', 'movies', 'notes', 'calc', 'terminal', 'settings'].map((k) => ({ key: k, label: APPS[k].name, open: () => openApp(k) })),
+    ...['browser', 'games', 'ai', 'movies', 'notes', 'calc', 'terminal', 'timer', 'settings'].map((k) => ({ key: k, label: APPS[k].name, open: () => openApp(k) })),
     ...U.favs().slice(0, 12).map((id) => { const g = U.GBY.get(id); return { key: 'game:' + id, label: g.name, open: () => U.play(id, 'desktop') }; }),
   ];
   let iconList = [];
@@ -406,7 +437,7 @@
     showMenu(e.clientX, e.clientY, [
       ['New browser window', 'browser', () => openApp('browser')], ['New note', 'note', () => openApp('notes')], ['Play a random game', 'shuffle', () => U.randomGame()],
       null, ...themes, null,
-      ['Send in a shark', 'zap', () => window.Sea && Sea.spawn('shark')],
+      ['Send in a shark', 'zap', () => window.Reef && Reef.spawn('shark')],
       ['Settings', 'sliders', () => U.openSettings()], ['Switch to browser mode', 'power', () => U.setMode('browser')],
     ]);
   });
@@ -420,7 +451,7 @@
       entered = true;
       U.hydrateIcons($('#desktop'));
       renderIcons(); renderWidgets(); renderTaskbar(); tickClock();
-      if (!U.store.get('desktopIntro')) { U.store.set('desktopIntro', 1); U.toast('Desktop mode. Right-click the water for options; Alt+D switches back.', 'monitor'); }
+      if (!U.store.get('desktopIntro')) { U.store.set('desktopIntro', 1); U.toast('Desktop mode. Use “Exit desktop” on the taskbar to go back.', 'monitor'); }
     },
     exit() { toggleStart(false); $('#ctx-menu').hidden = true; },
     openApp, openBrowser, openGame,
@@ -428,5 +459,11 @@
     toggleStart,
     escape() { if (!$('#start-menu').hidden) toggleStart(false); else if (!$('#ctx-menu').hidden) $('#ctx-menu').hidden = true; },
     covered() { return wins.some((W) => W.max && !W.min); },
+    showDesktop() {
+      const open = wins.filter((W) => !W.min);
+      if (open.length) { open.forEach((W) => { W.min = true; W.el.classList.add('minimized'); }); focused = null; lastShown = open; }
+      else if (lastShown.length) { lastShown.forEach((W) => { if (wins.includes(W)) { W.min = false; W.el.classList.remove('minimized'); } }); const top = lastShown[lastShown.length - 1]; if (wins.includes(top)) focusWin(top); lastShown = []; }
+      renderTaskbar(); U.updateOcean();
+    },
   };
 })();

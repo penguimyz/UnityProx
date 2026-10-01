@@ -26,6 +26,7 @@ uniform float uOct;
 uniform float uRays;
 uniform float uSnow;
 uniform float uCaus;
+uniform float uDisp;
 uniform vec4 uRip[6];
 
 #define TAU 6.2831853
@@ -83,7 +84,7 @@ void main(){
   rd=vec3(rd.x,rd.y*cp+rd.z*sp,-rd.y*sp+rd.z*cp);
   float cy=cos(yaw),sy=sin(yaw);
   rd=vec3(rd.x*cy+rd.z*sy,rd.y,-rd.x*sy+rd.z*cy);
-  vec3 ro=vec3(0.,0.,t*.12);
+  vec3 ro=vec3(0.);
 
   vec3 sunDir=normalize(vec3(.3,1.,.65));
 
@@ -133,7 +134,8 @@ void main(){
     vec3 rockC=mix(uSand*.32,vec3(.10,.20,.15),.55)*(.65+.7*fbm(P*2.6));
     sand=mix(sand,rockC,rock);
     vec2 cu=P*.3;float ct=t*.42;
-    vec3 cs=vec3(caustic(cu+vec2(.006,0.),ct),caustic(cu,ct),caustic(cu-vec2(.006,0.),ct));
+    float cg=caustic(cu,ct);
+    vec3 cs=uDisp>.5?vec3(caustic(cu+vec2(.006,0.),ct),cg,caustic(cu-vec2(.006,0.),ct)):vec3(cg);
     float lightMask=.5+.5*noise(P*.13+t*.04);
     vec3 lit=sand*(.3+.7*lightMask)+uSun*cs*uCaus*1.25*lightMask*(1.-rock*.5);
     lit*=mix(vec3(1.),uShallow*2.2,.28);
@@ -200,45 +202,28 @@ void main(){
 }`;
 
   const QUALITY = {
-    low:    { scale: 0.33, oct: 3, fps: 30, life: 0.45 },
-    medium: { scale: 0.55, oct: 4, fps: 60, life: 0.75 },
-    high:   { scale: 0.8,  oct: 5, fps: 60, life: 1 },
-    ultra:  { scale: 1.0,  oct: 6, fps: 60, life: 1.25 },
+    low:    { scale: 0.3,  oct: 3, fps: 30, disp: 0 },
+    medium: { scale: 0.45, oct: 4, fps: 60, disp: 0 },
+    high:   { scale: 0.7,  oct: 5, fps: 60, disp: 1 },
+    ultra:  { scale: 1.0,  oct: 6, fps: 60, disp: 1 },
   };
+  const hexToLin = (hex) => { const n = parseInt(hex.replace('#', ''), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => Math.pow(c / 255, 2.2)); };
 
-  const hexToLin = (hex) => {
-    const n = parseInt(hex.replace('#', ''), 16);
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => Math.pow(c / 255, 2.2));
-  };
-  const hexToRgb = (hex) => {
-    const n = parseInt(hex.replace('#', ''), 16);
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-  };
-  const mixRgb = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
-  const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
-  const rand = (a, b) => a + Math.random() * (b - a);
-
-  let glCv, ovCv, gl, prog, U = {};
+  let glCv, lifeCv, gl, prog, U = {};
   let W = 0, H = 0, dpr = 1;
-  let quality = 'medium', Q = QUALITY.medium;
-  let enabled = true, visible = true, paused = false;
-  let t0 = performance.now(), lastFrame = 0, simTime = 0, lastNow = 0;
-  let mouse = { x: -9999, y: -9999, nx: 0.5, ny: 0.5 }, look = [0, 0], lookTarget = [0, 0];
+  let quality = 'medium', Q = QUALITY.medium, autoScale = 1;
+  let enabled = true, paused = false;
+  let lastFrame = 0, simTime = 0, lastNow = 0;
+  const mouse = { nx: 0.5, ny: 0.5 }, look = [0, 0];
+  let lookTarget = [0, 0];
   const ripples = [];
   let theme = null;
-  let fpsCb = null, fpsCount = 0, fpsLast = performance.now();
+  let fpsCb = null, fpsCount = 0, fpsLast = performance.now(), perfFrames = 0, perfStart = 0;
 
-  /* ---------- WebGL ---------- */
   function initGL() {
-    try {
-      gl = glCv.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false, powerPreference: 'low-power' });
-    } catch (e) { gl = null; }
+    try { gl = glCv.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false, powerPreference: 'default' }); } catch (e) { gl = null; }
     if (!gl) return false;
-    const sh = (type, src) => {
-      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.warn(gl.getShaderInfoLog(s)); return null; }
-      return s;
-    };
+    const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) { console.warn(gl.getShaderInfoLog(o)); return null; } return o; };
     const vs = sh(gl.VERTEX_SHADER, VERT), fs = sh(gl.FRAGMENT_SHADER, FRAG);
     if (!vs || !fs) { gl = null; return false; }
     prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
@@ -247,127 +232,92 @@ void main(){
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
     const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    ['uRes', 'uTime', 'uLook', 'uMouse', 'uShallow', 'uDeep', 'uSand', 'uSun', 'uAccent', 'uBio', 'uOct', 'uRays', 'uSnow', 'uCaus', 'uRip']
-      .forEach((n) => { U[n] = gl.getUniformLocation(prog, n); });
+    ['uRes', 'uTime', 'uLook', 'uMouse', 'uShallow', 'uDeep', 'uSand', 'uSun', 'uAccent', 'uBio', 'uOct', 'uRays', 'uSnow', 'uCaus', 'uDisp', 'uRip'].forEach((n) => { U[n] = gl.getUniformLocation(prog, n); });
     glCv.addEventListener('webglcontextlost', (e) => { e.preventDefault(); gl = null; });
     return true;
   }
-
   function applyThemeUniforms() {
     if (!gl || !theme) return;
-    gl.uniform3fv(U.uShallow, hexToLin(theme.shallow));
-    gl.uniform3fv(U.uDeep, hexToLin(theme.deep));
-    gl.uniform3fv(U.uSand, hexToLin(theme.sand));
-    gl.uniform3fv(U.uSun, hexToLin(theme.sun));
-    gl.uniform3fv(U.uAccent, hexToLin(theme.accent));
-    gl.uniform1f(U.uBio, theme.bio || 0);
-    gl.uniform1f(U.uRays, theme.rays == null ? 1 : theme.rays);
-    gl.uniform1f(U.uSnow, theme.snow == null ? 1 : theme.snow);
-    gl.uniform1f(U.uCaus, theme.caustics == null ? 1 : theme.caustics);
+    gl.uniform3fv(U.uShallow, hexToLin(theme.shallow)); gl.uniform3fv(U.uDeep, hexToLin(theme.deep)); gl.uniform3fv(U.uSand, hexToLin(theme.sand));
+    gl.uniform3fv(U.uSun, hexToLin(theme.sun)); gl.uniform3fv(U.uAccent, hexToLin(theme.accent));
+    gl.uniform1f(U.uBio, theme.bio || 0); gl.uniform1f(U.uRays, theme.rays == null ? 1 : theme.rays);
+    gl.uniform1f(U.uSnow, theme.snow == null ? 1 : theme.snow); gl.uniform1f(U.uCaus, theme.caustics == null ? 1 : theme.caustics);
   }
-
   function resize() {
     W = innerWidth; H = innerHeight; dpr = Math.min(devicePixelRatio || 1, 2);
-    const s = quality === 'ultra' ? dpr : Q.scale;
+    const s = (quality === 'ultra' ? dpr : Q.scale) * autoScale;
     glCv.width = Math.max(2, Math.round(W * s)); glCv.height = Math.max(2, Math.round(H * s));
     if (gl) gl.viewport(0, 0, glCv.width, glCv.height);
-    if (window.Sea) Sea.resize(W, H, quality);
-    fogTimer = 0;
+    if (window.Reef) Reef.resize(W, H, quality);
   }
-
   function drawGL(time) {
     if (!gl) return fallback2D();
-    gl.uniform2f(U.uRes, glCv.width, glCv.height);
-    gl.uniform1f(U.uTime, time);
-    gl.uniform2f(U.uLook, look[0], look[1]);
-    gl.uniform2f(U.uMouse, mouse.nx, 1 - mouse.ny);
-    gl.uniform1f(U.uOct, Q.oct);
+    gl.uniform2f(U.uRes, glCv.width, glCv.height); gl.uniform1f(U.uTime, time);
+    gl.uniform2f(U.uLook, look[0], look[1]); gl.uniform2f(U.uMouse, mouse.nx, 1 - mouse.ny);
+    gl.uniform1f(U.uOct, Q.oct); gl.uniform1f(U.uDisp, Q.disp);
     const arr = new Float32Array(24);
     ripples.forEach((r, i) => { if (i < 6) { arr[i * 4] = r.x; arr[i * 4 + 1] = r.y; arr[i * 4 + 2] = r.t; arr[i * 4 + 3] = r.s; } });
     gl.uniform4fv(U.uRip, arr);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
-
   function fallback2D() {
     const c = glCv.getContext('2d'); if (!c || !theme) return;
     const g = c.createLinearGradient(0, 0, 0, glCv.height);
     g.addColorStop(0, theme.shallow); g.addColorStop(0.7, theme.deep); g.addColorStop(1, theme.sand);
     c.fillStyle = g; c.fillRect(0, 0, glCv.width, glCv.height);
   }
-
-  /* ---------- fog sampling: feed the pixel layer the real water colour per row ---------- */
-  let fogTimer = 0, fogBuf = null;
-  function sampleFog() {
-    if (!gl || !window.Sea) return;
-    const gh = glCv.height, gw = glCv.width, lh = Sea.lowH; if (!lh) return;
-    if (!fogBuf || fogBuf.length !== gh * 4) fogBuf = new Uint8Array(gh * 4);
-    const acc = new Float32Array(gh * 3);
-    for (const fx of [0.12, 0.5, 0.88]) {
-      gl.readPixels(Math.floor(gw * fx), 0, 1, gh, gl.RGBA, gl.UNSIGNED_BYTE, fogBuf);
-      for (let y = 0; y < gh; y++) { acc[y * 3] += fogBuf[y * 4]; acc[y * 3 + 1] += fogBuf[y * 4 + 1]; acc[y * 3 + 2] += fogBuf[y * 4 + 2]; }
-    }
-    const rows = new Float32Array(lh * 3);
-    for (let ly = 0; ly < lh; ly++) {
-      const gy = gh - 1 - Math.min(gh - 1, Math.floor((ly / lh) * gh)); // GL rows are bottom-up
-      rows[ly * 3] = acc[gy * 3] / 3; rows[ly * 3 + 1] = acc[gy * 3 + 1] / 3; rows[ly * 3 + 2] = acc[gy * 3 + 2] / 3;
-    }
-    Sea.setFogRows(rows);
+  /* dynamic resolution: if frames are slow, render the water smaller (and grow back when there's headroom) */
+  function adapt(now) {
+    if (!perfStart) { perfStart = now; perfFrames = 0; return; }
+    perfFrames++;
+    if (now - perfStart < 2000) return;
+    const fps = (perfFrames * 1000) / (now - perfStart); perfStart = now; perfFrames = 0;
+    const target = Q.fps;
+    if (fps < target * 0.8 && autoScale > 0.5) { autoScale = Math.max(0.5, autoScale * 0.82); resize(); if (window.Reef) Reef.setAutoScale(autoScale); }
+    else if (fps > target * 0.95 && autoScale < 1) { autoScale = Math.min(1, autoScale * 1.1); resize(); if (window.Reef) Reef.setAutoScale(autoScale); }
   }
 
-  /* ---------- loop ---------- */
   function frame(now) {
     requestAnimationFrame(frame);
-    const shouldRun = enabled && visible && !paused && !document.hidden;
-    if (!shouldRun) { lastNow = now; return; }
-    const minDt = 1000 / Q.fps - 2;
-    if (now - lastFrame < minDt) return;
+    if (!(enabled && !paused && !document.hidden)) { lastNow = now; perfStart = 0; return; }
+    if (now - lastFrame < 1000 / Q.fps - 2) return;
     lastFrame = now;
-    let dt = Math.min(0.05, (now - (lastNow || now)) / 1000); lastNow = now;
+    const dt = Math.min(0.05, (now - (lastNow || now)) / 1000); lastNow = now;
     simTime += dt;
     look[0] += (lookTarget[0] - look[0]) * 0.03; look[1] += (lookTarget[1] - look[1]) * 0.03;
     for (let i = ripples.length - 1; i >= 0; i--) if (simTime - ripples[i].t > 4) ripples.splice(i, 1);
     drawGL(simTime);
-    fogTimer -= dt; if (fogTimer <= 0) { sampleFog(); fogTimer = 1.2; }
-    if (window.Sea) Sea.tick(dt, simTime);
+    if (window.Reef) Reef.render(dt, simTime, look);
+    adapt(now);
     fpsCount++;
     if (fpsCb && now - fpsLast > 500) { fpsCb(Math.round((fpsCount * 1000) / (now - fpsLast))); fpsCount = 0; fpsLast = now; }
     else if (!fpsCb) { fpsCount = 0; fpsLast = now; }
   }
 
-  /* ---------- public API ---------- */
   const Water = {
-    init(glCanvas, overlayCanvas) {
-      glCv = glCanvas; ovCv = overlayCanvas;
-      if (window.Sea) Sea.init(ovCv);
+    init(glCanvas, lifeCanvas) {
+      glCv = glCanvas; lifeCv = lifeCanvas;
       const ok = initGL();
-      if (!ok) glCv.dataset.fallback = '1';
+      if (window.Reef) Reef.init(lifeCv);
       addEventListener('resize', resize);
-      addEventListener('pointermove', (e) => {
-        mouse.x = e.clientX; mouse.y = e.clientY; mouse.nx = e.clientX / innerWidth; mouse.ny = e.clientY / innerHeight;
-        lookTarget = [(mouse.nx - 0.5) * 2, -(mouse.ny - 0.5) * 2];
-        if (window.Sea) Sea.pointer(e.clientX, e.clientY);
-      }, { passive: true });
-      document.addEventListener('pointerleave', () => { mouse.x = mouse.y = -9999; });
+      addEventListener('pointermove', (e) => { mouse.nx = e.clientX / innerWidth; mouse.ny = e.clientY / innerHeight; lookTarget = [(mouse.nx - 0.5) * 2, -(mouse.ny - 0.5) * 2]; }, { passive: true });
       resize();
       requestAnimationFrame(frame);
       return ok;
     },
-    setTheme(th) {
-      theme = th; applyThemeUniforms(); if (window.Sea) { Sea.setTheme(th); Sea.refog(); } fogTimer = 0.3;
-      if (!gl) fallback2D();
-    },
-    setQuality(q) { if (!QUALITY[q]) return; quality = q; Q = QUALITY[q]; resize(); },
-    setEnabled(v) { enabled = v; glCv.style.opacity = ovCv.style.opacity = v ? '1' : '0'; },
-    setVisible(v) { visible = v; },
+    setTheme(th) { theme = th; applyThemeUniforms(); if (window.Reef) Reef.setTheme(th); if (!gl) fallback2D(); },
+    setQuality(q) { if (!QUALITY[q]) return; quality = q; Q = QUALITY[q]; autoScale = 1; if (window.Reef) Reef.setAutoScale(1); resize(); },
+    setEnabled(v) { enabled = v; glCv.style.opacity = lifeCv.style.opacity = v ? '1' : '0'; },
     setPaused(v) { paused = v; },
-    setLife(k, v) { if (window.Sea) Sea.setLife(k, v); },
-    setDensity(m) { if (window.Sea) Sea.setDensity(m); },
+    setLife(k, v) { if (window.Reef) Reef.setLife(k, v); },
+    setDensity(m) { if (window.Reef) Reef.setDensity(m); },
     onFps(cb) { fpsCb = cb; },
     click(x, y) {
       ripples.unshift({ x: x / W, y: 1 - y / H, t: simTime, s: 1 }); if (ripples.length > 6) ripples.pop();
-      if (window.Sea) Sea.click(x, y);
+      if (window.Reef) Reef.click(x, y);
     },
     get hasGL() { return !!gl; },
+    get autoScale() { return autoScale; },
   };
   window.Water = Water;
 })();
