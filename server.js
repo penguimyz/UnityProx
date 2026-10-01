@@ -1,93 +1,211 @@
 const express = require('express');
 const path = require('path');
+const http = require('http');
+const https = require('https');
+const { Readable } = require('stream');
 const { rateLimit } = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── stealth ─────────────────────────────────────────────────
+/* ── Ollama config ─────────────────────────────────────────────
+   OLLAMA_URL     where Ollama lives, e.g. http://100.101.102.103:11434 (Tailscale IP)
+                  or https://my-pc.tail1234.ts.net (Tailscale Funnel)
+   OLLAMA_MODEL   default model (deepseek-r1:7b)
+   TS_AUTHKEY     if set, start.sh joins your tailnet and exposes an HTTP proxy on :1055
+   TS_HTTP_PROXY  override the proxy address (defaults to http://127.0.0.1:1055 when TS_AUTHKEY is set)
+   OLLAMA_AUTH    optional Authorization header value (if you put Ollama behind an auth proxy) */
+const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/+$/, '');
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'deepseek-r1:7b';
+const TS_PROXY = process.env.TS_HTTP_PROXY || (process.env.TS_AUTHKEY ? 'http://127.0.0.1:1055' : '');
+const OLLAMA_AUTH = process.env.OLLAMA_AUTH || '';
+
 app.disable('x-powered-by');
 app.use((_req, res, next) => { res.removeHeader('Server'); next(); });
 app.use(express.json({ limit: '2mb' }));
 
-// ── rate limits ──────────────────────────────────────────────
-const proxyLim = rateLimit({ windowMs: 60000, max: 300 });
-const aiLim = rateLimit({ windowMs: 60000, max: 40 });
+function ollamaRequest(method, pathname, body, idleMs = 120000) {
+  return new Promise((resolve, reject) => {
+    if (!OLLAMA_URL) return reject(new Error('OLLAMA_URL is not set'));
+    const target = new URL(OLLAMA_URL + pathname);
+    const payload = body ? JSON.stringify(body) : null;
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/x-ndjson, application/json' };
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    if (OLLAMA_AUTH) headers.Authorization = OLLAMA_AUTH;
+    let mod, opts;
+    if (TS_PROXY && target.protocol === 'http:') {
+      // Tailscale userspace networking: plain-HTTP forward proxy, absolute-URI request line
+      const pu = new URL(TS_PROXY);
+      mod = http;
+      opts = { host: pu.hostname, port: pu.port || 80, path: target.href, method, headers: { ...headers, Host: target.host } };
+    } else {
+      mod = target.protocol === 'https:' ? https : http;
+      opts = { hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80), path: target.pathname + target.search, method, headers };
+    }
+    const r = mod.request(opts, resolve);
+    r.on('error', reject);
+    r.setTimeout(idleMs, () => r.destroy(new Error('timed out')));
+    if (payload) r.write(payload);
+    r.end();
+  });
+}
+
+function readAll(stream) {
+  return new Promise((resolve) => { let s = ''; stream.on('data', (c) => (s += c)); stream.on('end', () => resolve(s)); stream.on('error', () => resolve(s)); });
+}
+
+let statusCache = { at: 0, data: null };
+async function ollamaStatus() {
+  if (!OLLAMA_URL) return { configured: false, online: false, models: [], model: OLLAMA_MODEL };
+  if (Date.now() - statusCache.at < 15000 && statusCache.data) return statusCache.data;
+  let data;
+  try {
+    const r = await ollamaRequest('GET', '/api/tags', null, 5000);
+    const txt = await readAll(r);
+    const j = JSON.parse(txt || '{}');
+    data = { configured: true, online: r.statusCode === 200, models: (j.models || []).map((m) => m.name), model: OLLAMA_MODEL, via: TS_PROXY ? 'tailscale' : 'direct' };
+  } catch (e) {
+    data = { configured: true, online: false, models: [], model: OLLAMA_MODEL, error: e.message, via: TS_PROXY ? 'tailscale' : 'direct' };
+  }
+  statusCache = { at: Date.now(), data };
+  return data;
+}
+
+app.get('/ai/status', async (_req, res) => {
+  res.json({ ollama: await ollamaStatus(), pollinations: true });
+});
+
+/* ── AI relay — streams NDJSON lines: {d:"text"} {k:"think",d:"…"} {done:true} {error:"…"} ── */
+app.post('/ai', rateLimit({ windowMs: 60000, max: 40 }), async (req, res) => {
+  const { provider = 'pollinations', model, messages = [] } = req.body || {};
+  const msgs = (Array.isArray(messages) ? messages : [])
+    .filter((m) => m && typeof m.content === 'string' && ['system', 'user', 'assistant'].includes(m.role))
+    .slice(-40)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 20000) }));
+  if (!msgs.length) return res.status(400).json({ error: 'No messages' });
+
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const send = (o) => res.write(JSON.stringify(o) + '\n');
+
+  if (provider === 'ollama') {
+    let upstream;
+    let closed = false;
+    res.on('close', () => { closed = true; if (upstream) upstream.destroy(); });
+    try {
+      upstream = await ollamaRequest('POST', '/api/chat', {
+        model: model || OLLAMA_MODEL, messages: msgs, stream: true, keep_alive: '30m',
+      });
+    } catch (e) {
+      send({ error: `Can't reach your Ollama server (${e.message}). Check that the PC is on and connected to Tailscale.` });
+      return res.end();
+    }
+    if (upstream.statusCode !== 200) {
+      const txt = await readAll(upstream);
+      let msg = txt; try { msg = JSON.parse(txt).error || txt; } catch {}
+      send({ error: `Ollama returned ${upstream.statusCode}: ${String(msg).slice(0, 300)}` });
+      return res.end();
+    }
+    let buf = '';
+    upstream.setEncoding('utf8');
+    upstream.on('data', (chunk) => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line) continue;
+        try {
+          const j = JSON.parse(line);
+          if (j.error) send({ error: j.error });
+          if (j.message?.thinking) send({ k: 'think', d: j.message.thinking });
+          if (j.message?.content) send({ d: j.message.content });
+          if (j.done) send({ done: true, stats: { tokens: j.eval_count, ms: Math.round((j.total_duration || 0) / 1e6) } });
+        } catch {}
+      }
+    });
+    upstream.on('end', () => { if (!closed) res.end(); });
+    upstream.on('error', (e) => { if (!closed) { send({ error: e.message }); res.end(); } });
+    return;
+  }
+
+  // Pollinations (no key)
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const r = await fetch('https://text.pollinations.ai/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model || 'openai', messages: msgs, private: true }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      console.error('[ai] upstream error', r.status, txt.slice(0, 200));
+      send({ error: `The AI service returned ${r.status}. Try again in a moment.` });
+      return res.end();
+    }
+    const d = await r.json();
+    const reply = d.choices?.[0]?.message?.content;
+    if (!reply) send({ error: 'No response from the AI. Try again.' });
+    else { send({ d: reply }); send({ done: true }); }
+    res.end();
+  } catch (err) {
+    clearTimeout(timeout);
+    send({ error: err.name === 'AbortError' ? 'AI request timed out. Try again.' : 'Could not reach the AI service. Try again in a moment.' });
+    res.end();
+  }
+});
 
 // ── CORS proxy ───────────────────────────────────────────────
-app.use('/fetch', proxyLim, async (req, res) => {
+app.use('/fetch', rateLimit({ windowMs: 60000, max: 300 }), async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'Missing ?url=' });
   let parsed;
   try { parsed = new URL(target); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!/^https?:$/.test(parsed.protocol)) return res.status(400).json({ error: 'Only http(s) URLs' });
 
-  const { default: fetch } = await import('node-fetch');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+
   try {
     const upstream = await fetch(parsed.href, {
-      method: req.method,
+      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': req.headers['accept'] || 'text/html,application/xhtml+xml,*/*',
+        Accept: req.headers.accept || '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': parsed.origin,
-        'Origin': parsed.origin,
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-ch-ua': '"Google Chrome";v="125"',
-        'sec-ch-ua-platform': '"Windows"',
+        Referer: parsed.origin,
+        Origin: parsed.origin,
       },
       redirect: 'follow',
+      signal: controller.signal,
     });
 
+    clearTimeout(timeout);
     res.status(upstream.status);
-    const STRIP = ['content-encoding','transfer-encoding','x-frame-options','content-security-policy','frame-options','x-content-type-options'];
+    const strip = ['content-encoding', 'content-length', 'transfer-encoding', 'x-frame-options', 'content-security-policy', 'frame-options', 'connection'];
     for (const [k, v] of upstream.headers.entries()) {
-      if (!STRIP.includes(k.toLowerCase())) res.setHeader(k, v);
+      if (!strip.includes(k.toLowerCase())) res.setHeader(k, v);
     }
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
-    upstream.body.pipe(res);
+    if (!upstream.body) return res.end();
+    // native fetch returns a web stream — convert before piping (the old .pipe() call crashed)
+    Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
   } catch (err) {
-    res.status(502).json({ error: 'Upstream failed', detail: err.message });
+    clearTimeout(timeout);
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream failed', detail: err.message });
+    else res.end();
   }
 });
 
-// ── AI proxy (no client-side API key needed) ─────────────────
-// Requires ANTHROPIC_API_KEY env var set in Railway
-app.post('/api/ai', aiLim, async (req, res) => {
-  const { model = 'claude-sonnet-4-6', messages = [] } = req.body;
-  if (!messages.length) return res.status(400).json({ error: 'No messages' });
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: 'AI not configured', reply: 'Set ANTHROPIC_API_KEY in Railway environment variables to enable the AI tab.' });
-
-  const { default: fetch } = await import('node-fetch');
-  try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 1000,
-        system: 'You are the Unity AI — built into a browser proxy called Unity. Be sharp, helpful, and concise. Ocean-themed interface.',
-        messages,
-      }),
-    });
-    const data = await r.json();
-    const reply = data.content?.[0]?.text || data.error?.message || 'No response from model.';
-    res.json({ reply });
-  } catch (err) {
-    res.status(502).json({ error: 'AI request failed', detail: err.message });
-  }
-});
-
-// ── static ───────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.listen(PORT, () => console.log(`unity on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`unity on :${PORT}`);
+  if (OLLAMA_URL) console.log(`[ai] ollama -> ${OLLAMA_URL} (${TS_PROXY ? 'via tailscale proxy ' + TS_PROXY : 'direct'}) model=${OLLAMA_MODEL}`);
+  else console.log('[ai] OLLAMA_URL not set — only the no-key cloud models are available');
+});
